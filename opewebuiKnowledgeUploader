@@ -1,4 +1,3 @@
-#opewebuiKnowledgeUploader.ps1
 #requires -Version 7.0
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -11,13 +10,14 @@ $ErrorActionPreference = 'Stop'
     - Feature: Minimum file size filter to prevent empty-file crashes
     - Feature: Master Try/Catch resilience (prevents complete script halts)
     - Feature: Dedicated sync-errors.txt log for easy troubleshooting
+    - Patch: Replaced invalid continue statement with explicit :FileLoop label
 #>
 
 # ------------------------------
 # CONFIGURE HERE
 # ------------------------------
 $OpenWebUIBaseUrl     = "http://localhost:3000"
-$OpenWebUIToken       = "<API TOKEN"
+$OpenWebUIToken       = "<API TOKEN>"
 $KnowledgeId          = "<KNOWLEDGE GUID>"
 $RootPath             = "C:\AI\Knowledge\<SECTION>"
 $LogRoot              = "C:\AI\Knowledge\Uploadlog"
@@ -421,6 +421,7 @@ $junkFilesMoved = 0
 Write-Host "Found $totalFilesCount files to evaluate." -ForegroundColor Cyan
 Write-Host "---------------------------------------------------"
 
+:FileLoop
 foreach ($file in $files) {
     $currentIndex++
 
@@ -442,7 +443,7 @@ foreach ($file in $files) {
         if ($file.Length -lt $MinSizeBytes) {
             $skippedFiles++
             Write-Host "[SKIP]     $relativePath (Too small: $($file.Length) bytes)" -ForegroundColor DarkGray
-            continue
+            continue FileLoop
         }
 
         # ---------------------------------------------------------
@@ -466,11 +467,11 @@ foreach ($file in $files) {
                 Write-Host " -> FAILED TO MOVE" -ForegroundColor Red
                 Write-ErrorLog -RelativePath $relativePath -ErrorMessage "Failed to move junk file: $($_.Exception.Message)"
             }
-            continue
+            continue FileLoop
         }
 
         if ($ExcludeExtensions -contains $ext) {
-            continue
+            continue FileLoop
         }
 
         $signature = Get-FileSignature -File $file
@@ -522,7 +523,7 @@ foreach ($file in $files) {
                 -SizeBytes $signature.SizeBytes `
                 -LastWriteUtc $signature.LastWriteUtc `
                 -Hash $safeHash
-            continue
+            continue FileLoop
         }
 
         $processedFiles++
@@ -633,7 +634,7 @@ foreach ($file in $files) {
                     LastError     = 'Upload failed after retries.'
                 }
                 Save-State -State $state
-                continue
+                continue FileLoop
             }
         }
 
@@ -710,7 +711,7 @@ foreach ($file in $files) {
                         LastError      = $displayError
                     }
                     Save-State -State $state
-                    continue 2
+                    continue FileLoop
                 }
             }
             catch {
@@ -756,7 +757,7 @@ foreach ($file in $files) {
                 LastError      = "Processing timed out."
             }
             Save-State -State $state
-            continue
+            continue FileLoop
         }
 
         Write-Host "  [ADD]      Linking to knowledge collection..." -ForegroundColor Magenta -NoNewline
@@ -866,7 +867,7 @@ foreach ($file in $files) {
         Write-Host " -> FATAL EXCEPTION ENCOUNTERED" -ForegroundColor Red
         Write-ErrorLog -RelativePath $relativePath -ErrorMessage $_.Exception.Message -Details $_.ScriptStackTrace
         $failedFiles++
-        continue
+        continue FileLoop
     }
 }
 
