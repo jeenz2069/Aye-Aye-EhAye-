@@ -1,31 +1,30 @@
-opewebuiKnowledgeUploader 1.0
+#opewebuiKnowledgeUploader.ps1
 #requires -Version 7.0
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 <#
-    OpenWebUI Knowledge Sync - PowerShell 7 Edition
-    - Uploads files from a directory tree into OpenWebUI
-    - Waits for processing completion
-    - Adds the file to a knowledge collection
-    - Logs every step (JSONL and CSV)
-    - Skips unchanged files based on size + last modified time
-    - Resumes from a state file
-    - Gracefully handles "Duplicate content" 400 errors
-    - Moves unsupported file extensions to a separate Junk folder
+    OpenWebUI Knowledge Sync - PS7 Resilient Edition
+    - Fixed: Strict Mode compatibility for $stream and JSON parsing
+    - Fixed: PS7 DateTime auto-conversion during signature checks
+    - Feature: Universal Whitelist & Junk Mover
+    - Feature: Minimum file size filter to prevent empty-file crashes
+    - Feature: Master Try/Catch resilience (prevents complete script halts)
+    - Feature: Dedicated sync-errors.txt log for easy troubleshooting
 #>
 
 # ------------------------------
 # CONFIGURE HERE
 # ------------------------------
 $OpenWebUIBaseUrl     = "http://localhost:3000"
-$OpenWebUIToken       = "<TOKEN>"
-$KnowledgeId          = "<Knowledge GUID>"
-$RootPath             = "C:\AI\Knowledge\<CATEGORY>"
+$OpenWebUIToken       = "<API TOKEN"
+$KnowledgeId          = "<KNOWLEDGE GUID>"
+$RootPath             = "C:\AI\Knowledge\<SECTION>"
 $LogRoot              = "C:\AI\Knowledge\Uploadlog"
 $JunkPath             = "C:\AI\Knowledge\Junk"
 
-# Change detection:
+# Filters
+$MinSizeBytes         = 100 # Skips files smaller than this to prevent backend RAG crashes
 $UseHash              = $false
 
 # Upload / polling behavior
@@ -59,6 +58,7 @@ if (-not (Test-Path -LiteralPath $JunkPath)) {
 $StatePath      = Join-Path $LogRoot "state.json"
 $JsonlLogPath   = Join-Path $LogRoot "sync-log.jsonl"
 $SummaryCsvPath = Join-Path $LogRoot "sync-summary.csv"
+$ErrorLogPath   = Join-Path $LogRoot "sync-errors.txt"
 
 # ------------------------------
 # HELPERS
@@ -233,6 +233,25 @@ function Write-LogEntry {
 
     Write-JsonlLog -Entry $entry
     Write-SummaryCsv -Entry $entry
+}
+
+function Write-ErrorLog {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RelativePath,
+
+        [Parameter(Mandatory)]
+        [string]$ErrorMessage,
+
+        [string]$Details = ""
+    )
+    $timestamp = (Get-Date).ToUniversalTime().ToString("o")
+    $logLine = "[$timestamp] FILE: $RelativePath `r`nERROR: $ErrorMessage"
+    if (-not [string]::IsNullOrWhiteSpace($Details)) {
+        $logLine += "`r`nTRACE: $Details"
+    }
+    $logLine += "`r`n---------------------------------------------------"
+    Add-Content -LiteralPath $ErrorLogPath -Value $logLine -Encoding UTF8
 }
 
 function New-HttpClient {
@@ -411,144 +430,378 @@ foreach ($file in $files) {
         $percent = [math]::Floor(($currentIndex / $totalFilesCount) * 100)
     }
 
-    $ext = $file.Extension.ToLowerInvariant()
     $relativePath = Get-RelativePath -BasePath $RootPath -FullPath $file.FullName
 
-    # ---------------------------------------------------------
-    # JUNK MOVER LOGIC
-    # ---------------------------------------------------------
-    if ($IncludeExtensions.Count -gt 0 -and ($IncludeExtensions -notcontains $ext)) {
-        $skippedFiles++
-        
-        $junkDestDir = Join-Path $JunkPath (Split-Path $relativePath -Parent)
-        if (-not (Test-Path -LiteralPath $junkDestDir)) {
-            $null = New-Item -ItemType Directory -Path $junkDestDir -Force
+    # MASTER TRY/CATCH: Prevents any single file error from halting the entire script
+    try {
+        $ext = $file.Extension.ToLowerInvariant()
+
+        # ---------------------------------------------------------
+        # SIZE FILTER LOGIC
+        # ---------------------------------------------------------
+        if ($file.Length -lt $MinSizeBytes) {
+            $skippedFiles++
+            Write-Host "[SKIP]     $relativePath (Too small: $($file.Length) bytes)" -ForegroundColor DarkGray
+            continue
         }
-        $junkDestFile = Join-Path $junkDestDir $file.Name
 
-        Write-Host "[JUNK]     $relativePath (Unsupported format moved)" -ForegroundColor DarkMagenta
-        
-        try {
-            Move-Item -LiteralPath $file.FullName -Destination $junkDestFile -Force
-            $junkFilesMoved++
-        } catch {
-            Write-Host " -> FAILED TO MOVE" -ForegroundColor Red
-        }
-        continue
-    }
+        # ---------------------------------------------------------
+        # JUNK MOVER LOGIC
+        # ---------------------------------------------------------
+        if ($IncludeExtensions.Count -gt 0 -and ($IncludeExtensions -notcontains $ext)) {
+            $skippedFiles++
+            
+            $junkDestDir = Join-Path $JunkPath (Split-Path $relativePath -Parent)
+            if (-not (Test-Path -LiteralPath $junkDestDir)) {
+                $null = New-Item -ItemType Directory -Path $junkDestDir -Force
+            }
+            $junkDestFile = Join-Path $junkDestDir $file.Name
 
-    if ($ExcludeExtensions -contains $ext) {
-        continue
-    }
-
-    $signature = Get-FileSignature -File $file
-    
-    $safeHash = ""
-    if ($null -ne $signature.Hash) { $safeHash = $signature.Hash }
-
-    Write-Progress -Activity "Syncing Knowledge to OpenWebUI" -Status "File $currentIndex of ${totalFilesCount}: $relativePath" -PercentComplete $percent
-
-    $existing = $null
-    if ($state.ContainsKey($relativePath)) {
-        $existing = $state[$relativePath]
-    }
-
-    $sameSignature = $false
-    if ($null -ne $existing) {
-        if ($UseHash) {
-            $sameSignature = ($existing.SizeBytes -eq $signature.SizeBytes -and $existing.LastWriteUtc -eq $signature.LastWriteUtc -and $existing.Hash -eq $signature.Hash)
-        } else {
-            $sameSignature = ($existing.SizeBytes -eq $signature.SizeBytes -and $existing.LastWriteUtc -eq $signature.LastWriteUtc)
-        }
-    }
-
-    if ($sameSignature -and $existing.Status -eq 'Added') {
-        $skippedFiles++
-        
-        $logFileId = ""
-        if ($null -ne $existing.FileId) { $logFileId = $existing.FileId }
-
-        Write-Host "[SKIP]     $relativePath (Unchanged)" -ForegroundColor DarkGray
-        Write-LogEntry `
-            -RelativePath $relativePath `
-            -Stage 'Skip' `
-            -Outcome 'SkippedUnchanged' `
-            -Message 'File unchanged and already added to knowledge.' `
-            -FileId $logFileId `
-            -SizeBytes $signature.SizeBytes `
-            -LastWriteUtc $signature.LastWriteUtc `
-            -Hash $safeHash
-        continue
-    }
-
-    $processedFiles++
-    $reuseExistingFileId = $false
-    $fileId = $null
-
-    if ($sameSignature -and ($null -ne $existing.FileId) -and ($existing.Status -in @('Uploaded', 'Processed', 'Processing', 'AddFailed'))) {
-        $reuseExistingFileId = $true
-        $fileId = $existing.FileId
-        
-        $logFileId = ""
-        if ($null -ne $fileId) { $logFileId = $fileId }
-
-        Write-Host "[RESUME]   $relativePath (Previous upload found)" -ForegroundColor Yellow
-        Write-LogEntry `
-            -RelativePath $relativePath `
-            -Stage 'Resume' `
-            -Outcome 'ReusingExistingFileId' `
-            -Message 'Signature matched; resuming from prior file ID.' `
-            -FileId $logFileId `
-            -SizeBytes $signature.SizeBytes `
-            -LastWriteUtc $signature.LastWriteUtc `
-            -Hash $safeHash
-    }
-
-    if (-not $reuseExistingFileId) {
-        $uploadSuccess = $false
-        $uploadResponse = $null
-
-        Write-Host "[UPLOAD]   $relativePath " -ForegroundColor Cyan -NoNewline
-
-        for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+            Write-Host "[JUNK]     $relativePath (Unsupported format moved)" -ForegroundColor DarkMagenta
+            
             try {
-                $uploadResponse = Invoke-UploadFile -Client $client -FilePath $file.FullName
-                $uploadBody = $uploadResponse.Body
-                $uploadJson = Try-ParseJson -Text $uploadBody
-                
-                $uploadId = Get-SafeProperty -Object $uploadJson -PropertyName "id"
+                Move-Item -LiteralPath $file.FullName -Destination $junkDestFile -Force
+                $junkFilesMoved++
+            } catch {
+                Write-Host " -> FAILED TO MOVE" -ForegroundColor Red
+                Write-ErrorLog -RelativePath $relativePath -ErrorMessage "Failed to move junk file: $($_.Exception.Message)"
+            }
+            continue
+        }
 
-                if ($uploadResponse.Success -and ($null -ne $uploadId)) {
-                    $fileId = [string]$uploadId
-                    $uploadSuccess = $true
+        if ($ExcludeExtensions -contains $ext) {
+            continue
+        }
 
-                    Write-Host "-> OK " -ForegroundColor Green
+        $signature = Get-FileSignature -File $file
+        
+        $safeHash = ""
+        if ($null -ne $signature.Hash) { $safeHash = $signature.Hash }
 
-                    Write-LogEntry `
-                        -RelativePath $relativePath `
-                        -Stage 'Upload' `
-                        -Outcome 'Success' `
-                        -Attempt $attempt `
-                        -HttpStatusCode $uploadResponse.StatusCode `
-                        -Message 'File uploaded successfully.' `
-                        -FileId $fileId `
-                        -UploadResponseRaw $uploadBody `
-                        -SizeBytes $signature.SizeBytes `
-                        -LastWriteUtc $signature.LastWriteUtc `
-                        -Hash $safeHash
+        Write-Progress -Activity "Syncing Knowledge to OpenWebUI" -Status "File $currentIndex of ${totalFilesCount}: $relativePath" -PercentComplete $percent
 
-                    break
+        $existing = $null
+        if ($state.ContainsKey($relativePath)) {
+            $existing = $state[$relativePath]
+        }
+
+        # ---------------------------------------------------------
+        # PS7 DATE PARSING FIX
+        # ---------------------------------------------------------
+        $sameSignature = $false
+        if ($null -ne $existing) {
+            $stateDateStr = $existing.LastWriteUtc
+            
+            # If PS7 parsed the JSON date into a DateTime object, convert it back to match our signature format
+            if ($stateDateStr -is [datetime]) {
+                $stateDateStr = $stateDateStr.ToUniversalTime().ToString("o")
+            } else {
+                $stateDateStr = [string]$stateDateStr
+            }
+
+            if ($UseHash) {
+                $sameSignature = ($existing.SizeBytes -eq $signature.SizeBytes -and $stateDateStr -eq $signature.LastWriteUtc -and [string]$existing.Hash -eq [string]$signature.Hash)
+            } else {
+                $sameSignature = ($existing.SizeBytes -eq $signature.SizeBytes -and $stateDateStr -eq $signature.LastWriteUtc)
+            }
+        }
+
+        if ($sameSignature -and $existing.Status -eq 'Added') {
+            $skippedFiles++
+            
+            $logFileId = ""
+            if ($null -ne $existing.FileId) { $logFileId = $existing.FileId }
+
+            Write-Host "[SKIP]     $relativePath (Unchanged)" -ForegroundColor DarkGray
+            Write-LogEntry `
+                -RelativePath $relativePath `
+                -Stage 'Skip' `
+                -Outcome 'SkippedUnchanged' `
+                -Message 'File unchanged and already added to knowledge.' `
+                -FileId $logFileId `
+                -SizeBytes $signature.SizeBytes `
+                -LastWriteUtc $signature.LastWriteUtc `
+                -Hash $safeHash
+            continue
+        }
+
+        $processedFiles++
+        $reuseExistingFileId = $false
+        $fileId = $null
+
+        if ($sameSignature -and ($null -ne $existing.FileId) -and ($existing.Status -in @('Uploaded', 'Processed', 'Processing', 'AddFailed'))) {
+            $reuseExistingFileId = $true
+            $fileId = $existing.FileId
+            
+            $logFileId = ""
+            if ($null -ne $fileId) { $logFileId = $fileId }
+
+            Write-Host "[RESUME]   $relativePath (Previous upload found)" -ForegroundColor Yellow
+            Write-LogEntry `
+                -RelativePath $relativePath `
+                -Stage 'Resume' `
+                -Outcome 'ReusingExistingFileId' `
+                -Message 'Signature matched; resuming from prior file ID.' `
+                -FileId $logFileId `
+                -SizeBytes $signature.SizeBytes `
+                -LastWriteUtc $signature.LastWriteUtc `
+                -Hash $safeHash
+        }
+
+        if (-not $reuseExistingFileId) {
+            $uploadSuccess = $false
+            $uploadResponse = $null
+
+            Write-Host "[UPLOAD]   $relativePath " -ForegroundColor Cyan -NoNewline
+
+            for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+                try {
+                    $uploadResponse = Invoke-UploadFile -Client $client -FilePath $file.FullName
+                    $uploadBody = $uploadResponse.Body
+                    $uploadJson = Try-ParseJson -Text $uploadBody
+                    
+                    $uploadId = Get-SafeProperty -Object $uploadJson -PropertyName "id"
+
+                    if ($uploadResponse.Success -and ($null -ne $uploadId)) {
+                        $fileId = [string]$uploadId
+                        $uploadSuccess = $true
+
+                        Write-Host "-> OK " -ForegroundColor Green
+
+                        Write-LogEntry `
+                            -RelativePath $relativePath `
+                            -Stage 'Upload' `
+                            -Outcome 'Success' `
+                            -Attempt $attempt `
+                            -HttpStatusCode $uploadResponse.StatusCode `
+                            -Message 'File uploaded successfully.' `
+                            -FileId $fileId `
+                            -UploadResponseRaw $uploadBody `
+                            -SizeBytes $signature.SizeBytes `
+                            -LastWriteUtc $signature.LastWriteUtc `
+                            -Hash $safeHash
+
+                        break
+                    }
+                    else {
+                        Write-LogEntry `
+                            -RelativePath $relativePath `
+                            -Stage 'Upload' `
+                            -Outcome 'Failed' `
+                            -Attempt $attempt `
+                            -HttpStatusCode $uploadResponse.StatusCode `
+                            -Message 'Upload returned non-success or did not include file id.' `
+                            -Error $uploadBody `
+                            -UploadResponseRaw $uploadBody `
+                            -SizeBytes $signature.SizeBytes `
+                            -LastWriteUtc $signature.LastWriteUtc `
+                            -Hash $safeHash
+                    }
                 }
-                else {
+                catch {
                     Write-LogEntry `
                         -RelativePath $relativePath `
                         -Stage 'Upload' `
                         -Outcome 'Failed' `
                         -Attempt $attempt `
-                        -HttpStatusCode $uploadResponse.StatusCode `
-                        -Message 'Upload returned non-success or did not include file id.' `
-                        -Error $uploadBody `
-                        -UploadResponseRaw $uploadBody `
+                        -Message 'Upload threw an exception.' `
+                        -Error $_.Exception.Message `
+                        -SizeBytes $signature.SizeBytes `
+                        -LastWriteUtc $signature.LastWriteUtc `
+                        -Hash $safeHash
+                }
+
+                if ($attempt -lt $MaxRetries) {
+                    Write-Host "." -ForegroundColor Yellow -NoNewline
+                    Start-Sleep -Seconds $RetryDelaySeconds
+                }
+            }
+
+            if (-not $uploadSuccess) {
+                Write-Host "-> FAILED" -ForegroundColor Red
+                $failedFiles++
+                $state[$relativePath] = [ordered]@{
+                    RelativePath  = $relativePath
+                    FullPath      = $file.FullName
+                    SizeBytes     = $signature.SizeBytes
+                    LastWriteUtc  = $signature.LastWriteUtc
+                    Hash          = $signature.Hash
+                    Status        = 'UploadFailed'
+                    FileId        = $null
+                    Attempts      = $MaxRetries
+                    LastUpdatedUtc = (Get-Date).ToUniversalTime().ToString("o")
+                    LastError     = 'Upload failed after retries.'
+                }
+                Save-State -State $state
+                continue
+            }
+        }
+
+        $processingSucceeded = $false
+        $processStart = Get-Date
+
+        Write-Host "  [PROCESS] Waiting for OpenWebUI to vectorize..." -ForegroundColor DarkCyan -NoNewline
+
+        while (((Get-Date) - $processStart).TotalSeconds -lt $ProcessTimeoutSeconds) {
+            try {
+                $statusResponse = Invoke-GetProcessingStatus -Client $client -FileId $fileId
+                $statusBody = $statusResponse.Body
+                $statusJson = Try-ParseJson -Text $statusBody
+
+                $remoteStatus = ""
+                $remoteError = ""
+                
+                if ($null -ne $statusJson) {
+                    $statusVal = Get-SafeProperty -Object $statusJson -PropertyName "status"
+                    if ($null -ne $statusVal) { $remoteStatus = [string]$statusVal }
+                    
+                    $errorVal = Get-SafeProperty -Object $statusJson -PropertyName "error"
+                    if ($null -ne $errorVal) { $remoteError = [string]$errorVal }
+                }
+
+                Write-LogEntry `
+                    -RelativePath $relativePath `
+                    -Stage 'ProcessingStatus' `
+                    -Outcome 'Checked' `
+                    -HttpStatusCode $statusResponse.StatusCode `
+                    -FileId $fileId `
+                    -RemoteStatus $remoteStatus `
+                    -ProcessingStatusRaw $statusBody `
+                    -Message 'Polled processing status.' `
+                    -SizeBytes $signature.SizeBytes `
+                    -LastWriteUtc $signature.LastWriteUtc `
+                    -Hash $safeHash
+
+                if ($remoteStatus -eq 'completed') {
+                    $processingSucceeded = $true
+                    Write-Host "-> OK " -ForegroundColor Green
+                    break
+                }
+                elseif ($remoteStatus -eq 'failed') {
+                    $displayError = $statusBody
+                    if ($remoteError -ne "") { $displayError = $remoteError }
+
+                    Write-Host "-> FAILED ($displayError)" -ForegroundColor Red
+                    $failedFiles++
+                    
+                    Write-LogEntry `
+                        -RelativePath $relativePath `
+                        -Stage 'ProcessingStatus' `
+                        -Outcome 'Failed' `
+                        -FileId $fileId `
+                        -RemoteStatus 'failed' `
+                        -Message 'OpenWebUI reported processing failure.' `
+                        -Error $displayError `
+                        -ProcessingStatusRaw $statusBody `
+                        -SizeBytes $signature.SizeBytes `
+                        -LastWriteUtc $signature.LastWriteUtc `
+                        -Hash $safeHash
+
+                    $state[$relativePath] = [ordered]@{
+                        RelativePath   = $relativePath
+                        FullPath       = $file.FullName
+                        SizeBytes      = $signature.SizeBytes
+                        LastWriteUtc   = $signature.LastWriteUtc
+                        Hash           = $signature.Hash
+                        Status         = 'ProcessingFailed'
+                        FileId         = $fileId
+                        Attempts       = 1
+                        LastUpdatedUtc = (Get-Date).ToUniversalTime().ToString("o")
+                        LastError      = $displayError
+                    }
+                    Save-State -State $state
+                    continue 2
+                }
+            }
+            catch {
+                Write-LogEntry `
+                    -RelativePath $relativePath `
+                    -Stage 'ProcessingStatus' `
+                    -Outcome 'Failed' `
+                    -FileId $fileId `
+                    -Message 'Status polling threw an exception.' `
+                    -Error $_.Exception.Message `
+                    -SizeBytes $signature.SizeBytes `
+                    -LastWriteUtc $signature.LastWriteUtc `
+                    -Hash $safeHash
+            }
+
+            Write-Host "." -ForegroundColor DarkGray -NoNewline
+            Start-Sleep -Seconds $PollIntervalSeconds
+        }
+
+        if (-not $processingSucceeded) {
+            Write-Host "-> TIMEOUT" -ForegroundColor Red
+            $failedFiles++
+            Write-LogEntry `
+                -RelativePath $relativePath `
+                -Stage 'ProcessingStatus' `
+                -Outcome 'Timeout' `
+                -FileId $fileId `
+                -Message "Processing did not complete within $ProcessTimeoutSeconds seconds." `
+                -SizeBytes $signature.SizeBytes `
+                -LastWriteUtc $signature.LastWriteUtc `
+                -Hash $safeHash
+
+            $state[$relativePath] = [ordered]@{
+                RelativePath   = $relativePath
+                FullPath       = $file.FullName
+                SizeBytes      = $signature.SizeBytes
+                LastWriteUtc   = $signature.LastWriteUtc
+                Hash           = $signature.Hash
+                Status         = 'ProcessingTimeout'
+                FileId         = $fileId
+                Attempts       = 1
+                LastUpdatedUtc = (Get-Date).ToUniversalTime().ToString("o")
+                LastError      = "Processing timed out."
+            }
+            Save-State -State $state
+            continue
+        }
+
+        Write-Host "  [ADD]      Linking to knowledge collection..." -ForegroundColor Magenta -NoNewline
+        $addSuccess = $false
+        for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+            try {
+                $addResponse = Invoke-AddFileToKnowledge -Client $client -FileId $fileId
+                $addBody = $addResponse.Body
+                
+                $isDuplicate = ($addResponse.StatusCode -eq 400 -and $addBody -like "*Duplicate content detected*")
+
+                if ($addResponse.Success -or $isDuplicate) {
+                    $addSuccess = $true
+                    
+                    if ($isDuplicate) {
+                        Write-Host "-> ALREADY EXISTS (OK)" -ForegroundColor Yellow
+                    } else {
+                        Write-Host "-> SUCCESS" -ForegroundColor Green
+                    }
+
+                    Write-LogEntry `
+                        -RelativePath $relativePath `
+                        -Stage 'KnowledgeAdd' `
+                        -Outcome 'Success' `
+                        -Attempt $attempt `
+                        -HttpStatusCode $addResponse.StatusCode `
+                        -FileId $fileId `
+                        -Message 'File added to knowledge successfully.' `
+                        -KnowledgeResponseRaw $addBody `
+                        -SizeBytes $signature.SizeBytes `
+                        -LastWriteUtc $signature.LastWriteUtc `
+                        -Hash $safeHash
+                    break
+                }
+                else {
+                    Write-LogEntry `
+                        -RelativePath $relativePath `
+                        -Stage 'KnowledgeAdd' `
+                        -Outcome 'Failed' `
+                        -Attempt $attempt `
+                        -HttpStatusCode $addResponse.StatusCode `
+                        -FileId $fileId `
+                        -Message 'Knowledge add returned non-success.' `
+                        -Error $addBody `
+                        -KnowledgeResponseRaw $addBody `
                         -SizeBytes $signature.SizeBytes `
                         -LastWriteUtc $signature.LastWriteUtc `
                         -Hash $safeHash
@@ -557,10 +810,11 @@ foreach ($file in $files) {
             catch {
                 Write-LogEntry `
                     -RelativePath $relativePath `
-                    -Stage 'Upload' `
+                    -Stage 'KnowledgeAdd' `
                     -Outcome 'Failed' `
                     -Attempt $attempt `
-                    -Message 'Upload threw an exception.' `
+                    -FileId $fileId `
+                    -Message 'Knowledge add threw an exception.' `
                     -Error $_.Exception.Message `
                     -SizeBytes $signature.SizeBytes `
                     -LastWriteUtc $signature.LastWriteUtc `
@@ -568,253 +822,51 @@ foreach ($file in $files) {
             }
 
             if ($attempt -lt $MaxRetries) {
-                Write-Host "." -ForegroundColor Yellow -NoNewline
+                Write-Host "." -ForegroundColor Magenta -NoNewline
                 Start-Sleep -Seconds $RetryDelaySeconds
             }
         }
 
-        if (-not $uploadSuccess) {
-            Write-Host "-> FAILED" -ForegroundColor Red
-            $failedFiles++
+        if ($addSuccess) {
+            $successFiles++
             $state[$relativePath] = [ordered]@{
-                RelativePath  = $relativePath
-                FullPath      = $file.FullName
-                SizeBytes     = $signature.SizeBytes
-                LastWriteUtc  = $signature.LastWriteUtc
-                Hash          = $signature.Hash
-                Status        = 'UploadFailed'
-                FileId        = $null
-                Attempts      = $MaxRetries
+                RelativePath   = $relativePath
+                FullPath       = $file.FullName
+                SizeBytes      = $signature.SizeBytes
+                LastWriteUtc   = $signature.LastWriteUtc
+                Hash           = $signature.Hash
+                Status         = 'Added'
+                FileId         = $fileId
+                Attempts       = 1
                 LastUpdatedUtc = (Get-Date).ToUniversalTime().ToString("o")
-                LastError     = 'Upload failed after retries.'
+                LastError      = $null
             }
             Save-State -State $state
-            continue
+        }
+        else {
+            Write-Host " -> FAILED" -ForegroundColor Red
+            $failedFiles++
+            $state[$relativePath] = [ordered]@{
+                RelativePath   = $relativePath
+                FullPath       = $file.FullName
+                SizeBytes      = $signature.SizeBytes
+                LastWriteUtc   = $signature.LastWriteUtc
+                Hash           = $signature.Hash
+                Status         = 'AddFailed'
+                FileId         = $fileId
+                Attempts       = $MaxRetries
+                LastUpdatedUtc = (Get-Date).ToUniversalTime().ToString("o")
+                LastError      = 'Failed to add to knowledge after retries.'
+            }
+            Save-State -State $state
         }
     }
-
-    $processingSucceeded = $false
-    $processStart = Get-Date
-
-    Write-Host "  [PROCESS] Waiting for OpenWebUI to vectorize..." -ForegroundColor DarkCyan -NoNewline
-
-    while (((Get-Date) - $processStart).TotalSeconds -lt $ProcessTimeoutSeconds) {
-        try {
-            $statusResponse = Invoke-GetProcessingStatus -Client $client -FileId $fileId
-            $statusBody = $statusResponse.Body
-            $statusJson = Try-ParseJson -Text $statusBody
-
-            $remoteStatus = ""
-            $remoteError = ""
-            
-            if ($null -ne $statusJson) {
-                $statusVal = Get-SafeProperty -Object $statusJson -PropertyName "status"
-                if ($null -ne $statusVal) { $remoteStatus = [string]$statusVal }
-                
-                $errorVal = Get-SafeProperty -Object $statusJson -PropertyName "error"
-                if ($null -ne $errorVal) { $remoteError = [string]$errorVal }
-            }
-
-            Write-LogEntry `
-                -RelativePath $relativePath `
-                -Stage 'ProcessingStatus' `
-                -Outcome 'Checked' `
-                -HttpStatusCode $statusResponse.StatusCode `
-                -FileId $fileId `
-                -RemoteStatus $remoteStatus `
-                -ProcessingStatusRaw $statusBody `
-                -Message 'Polled processing status.' `
-                -SizeBytes $signature.SizeBytes `
-                -LastWriteUtc $signature.LastWriteUtc `
-                -Hash $safeHash
-
-            if ($remoteStatus -eq 'completed') {
-                $processingSucceeded = $true
-                Write-Host "-> OK " -ForegroundColor Green
-                break
-            }
-            elseif ($remoteStatus -eq 'failed') {
-                $displayError = $statusBody
-                if ($remoteError -ne "") { $displayError = $remoteError }
-
-                Write-Host "-> FAILED ($displayError)" -ForegroundColor Red
-                $failedFiles++
-                
-                Write-LogEntry `
-                    -RelativePath $relativePath `
-                    -Stage 'ProcessingStatus' `
-                    -Outcome 'Failed' `
-                    -FileId $fileId `
-                    -RemoteStatus 'failed' `
-                    -Message 'OpenWebUI reported processing failure.' `
-                    -Error $displayError `
-                    -ProcessingStatusRaw $statusBody `
-                    -SizeBytes $signature.SizeBytes `
-                    -LastWriteUtc $signature.LastWriteUtc `
-                    -Hash $safeHash
-
-                $state[$relativePath] = [ordered]@{
-                    RelativePath   = $relativePath
-                    FullPath       = $file.FullName
-                    SizeBytes      = $signature.SizeBytes
-                    LastWriteUtc   = $signature.LastWriteUtc
-                    Hash           = $signature.Hash
-                    Status         = 'ProcessingFailed'
-                    FileId         = $fileId
-                    Attempts       = 1
-                    LastUpdatedUtc = (Get-Date).ToUniversalTime().ToString("o")
-                    LastError      = $displayError
-                }
-                Save-State -State $state
-                continue 2
-            }
-        }
-        catch {
-            Write-LogEntry `
-                -RelativePath $relativePath `
-                -Stage 'ProcessingStatus' `
-                -Outcome 'Failed' `
-                -FileId $fileId `
-                -Message 'Status polling threw an exception.' `
-                -Error $_.Exception.Message `
-                -SizeBytes $signature.SizeBytes `
-                -LastWriteUtc $signature.LastWriteUtc `
-                -Hash $safeHash
-        }
-
-        Write-Host "." -ForegroundColor DarkGray -NoNewline
-        Start-Sleep -Seconds $PollIntervalSeconds
-    }
-
-    if (-not $processingSucceeded) {
-        Write-Host "-> TIMEOUT" -ForegroundColor Red
+    catch {
+        # Catch-all for any unforeseen fatal errors during file processing
+        Write-Host " -> FATAL EXCEPTION ENCOUNTERED" -ForegroundColor Red
+        Write-ErrorLog -RelativePath $relativePath -ErrorMessage $_.Exception.Message -Details $_.ScriptStackTrace
         $failedFiles++
-        Write-LogEntry `
-            -RelativePath $relativePath `
-            -Stage 'ProcessingStatus' `
-            -Outcome 'Timeout' `
-            -FileId $fileId `
-            -Message "Processing did not complete within $ProcessTimeoutSeconds seconds." `
-            -SizeBytes $signature.SizeBytes `
-            -LastWriteUtc $signature.LastWriteUtc `
-            -Hash $safeHash
-
-        $state[$relativePath] = [ordered]@{
-            RelativePath   = $relativePath
-            FullPath       = $file.FullName
-            SizeBytes      = $signature.SizeBytes
-            LastWriteUtc   = $signature.LastWriteUtc
-            Hash           = $signature.Hash
-            Status         = 'ProcessingTimeout'
-            FileId         = $fileId
-            Attempts       = 1
-            LastUpdatedUtc = (Get-Date).ToUniversalTime().ToString("o")
-            LastError      = "Processing timed out."
-        }
-        Save-State -State $state
         continue
-    }
-
-    Write-Host "  [ADD]      Linking to knowledge collection..." -ForegroundColor Magenta -NoNewline
-    $addSuccess = $false
-    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
-        try {
-            $addResponse = Invoke-AddFileToKnowledge -Client $client -FileId $fileId
-            $addBody = $addResponse.Body
-            
-            $isDuplicate = ($addResponse.StatusCode -eq 400 -and $addBody -like "*Duplicate content detected*")
-
-            if ($addResponse.Success -or $isDuplicate) {
-                $addSuccess = $true
-                
-                if ($isDuplicate) {
-                    Write-Host "-> ALREADY EXISTS (OK)" -ForegroundColor Yellow
-                } else {
-                    Write-Host "-> SUCCESS" -ForegroundColor Green
-                }
-
-                Write-LogEntry `
-                    -RelativePath $relativePath `
-                    -Stage 'KnowledgeAdd' `
-                    -Outcome 'Success' `
-                    -Attempt $attempt `
-                    -HttpStatusCode $addResponse.StatusCode `
-                    -FileId $fileId `
-                    -Message 'File added to knowledge successfully.' `
-                    -KnowledgeResponseRaw $addBody `
-                    -SizeBytes $signature.SizeBytes `
-                    -LastWriteUtc $signature.LastWriteUtc `
-                    -Hash $safeHash
-                break
-            }
-            else {
-                Write-LogEntry `
-                    -RelativePath $relativePath `
-                    -Stage 'KnowledgeAdd' `
-                    -Outcome 'Failed' `
-                    -Attempt $attempt `
-                    -HttpStatusCode $addResponse.StatusCode `
-                    -FileId $fileId `
-                    -Message 'Knowledge add returned non-success.' `
-                    -Error $addBody `
-                    -KnowledgeResponseRaw $addBody `
-                    -SizeBytes $signature.SizeBytes `
-                    -LastWriteUtc $signature.LastWriteUtc `
-                    -Hash $safeHash
-            }
-        }
-        catch {
-            Write-LogEntry `
-                -RelativePath $relativePath `
-                -Stage 'KnowledgeAdd' `
-                -Outcome 'Failed' `
-                -Attempt $attempt `
-                -FileId $fileId `
-                -Message 'Knowledge add threw an exception.' `
-                -Error $_.Exception.Message `
-                -SizeBytes $signature.SizeBytes `
-                -LastWriteUtc $signature.LastWriteUtc `
-                -Hash $safeHash
-        }
-
-        if ($attempt -lt $MaxRetries) {
-            Write-Host "." -ForegroundColor Magenta -NoNewline
-            Start-Sleep -Seconds $RetryDelaySeconds
-        }
-    }
-
-    if ($addSuccess) {
-        $successFiles++
-        $state[$relativePath] = [ordered]@{
-            RelativePath   = $relativePath
-            FullPath       = $file.FullName
-            SizeBytes      = $signature.SizeBytes
-            LastWriteUtc   = $signature.LastWriteUtc
-            Hash           = $signature.Hash
-            Status         = 'Added'
-            FileId         = $fileId
-            Attempts       = 1
-            LastUpdatedUtc = (Get-Date).ToUniversalTime().ToString("o")
-            LastError      = $null
-        }
-        Save-State -State $state
-    }
-    else {
-        Write-Host " -> FAILED" -ForegroundColor Red
-        $failedFiles++
-        $state[$relativePath] = [ordered]@{
-            RelativePath   = $relativePath
-            FullPath       = $file.FullName
-            SizeBytes      = $signature.SizeBytes
-            LastWriteUtc   = $signature.LastWriteUtc
-            Hash           = $signature.Hash
-            Status         = 'AddFailed'
-            FileId         = $fileId
-            Attempts       = $MaxRetries
-            LastUpdatedUtc = (Get-Date).ToUniversalTime().ToString("o")
-            LastError      = 'Failed to add to knowledge after retries.'
-        }
-        Save-State -State $state
     }
 }
 
@@ -841,6 +893,7 @@ Write-Host "---------------------------------------------------"
 Write-Host "Logs:"
 Write-Host "  $JsonlLogPath"
 Write-Host "  $SummaryCsvPath"
+Write-Host "  $ErrorLogPath"
 Write-Host "State:"
 Write-Host "  $StatePath"
 Write-Host ""
