@@ -10,6 +10,7 @@ $ErrorActionPreference = 'Stop'
     - Feature: Minimum file size filter to prevent empty-file crashes
     - Feature: Master Try/Catch resilience (prevents complete script halts)
     - Feature: Dedicated sync-errors.txt log for easy troubleshooting
+    - Feature: Empty directory tree cleanup during processing
     - Patch: Replaced invalid continue statement with explicit :FileLoop label
     - Patch: Atomic state writes to prevent corruption on power loss
     - Patch: Mandatory SHA256 hashing and file deletion upon successful sync
@@ -20,11 +21,11 @@ $ErrorActionPreference = 'Stop'
 # CONFIGURE HERE
 # ------------------------------
 $OpenWebUIBaseUrl     = "http://localhost:3000"
-$OpenWebUIToken       = "sk-e99c14569a274ce1a3658f97c15a6c59"
-$KnowledgeId          = "1c8c6f34-e301-431b-bef4-a5e81d72a4c6"
-$RootPath             = "C:\AI\Knowledge\Thycotic.Ihawu"
-$LogRoot              = "C:\AI\Knowledge\Uploadlog"
-$JunkPath             = "C:\AI\Knowledge\Junk"
+$OpenWebUIToken       = "sk-"
+$KnowledgeId          = ""
+$RootPath             = "C:\AI\"
+$LogRoot              = "C:\AI\log"
+$JunkPath             = "C:\AI\Junk"
 
 # Filters
 $MinSizeBytes         = 100 # Skips files smaller than this to prevent backend RAG crashes
@@ -70,6 +71,33 @@ $ApiHeaders = @{
 # ------------------------------
 # HELPERS
 # ------------------------------
+
+function Remove-EmptyDirectoryTree {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DirectoryPath,
+
+        [Parameter(Mandatory)]
+        [string]$RootLimitPath
+    )
+
+    $currentDir = [System.IO.Path]::GetFullPath($DirectoryPath)
+    $rootLimit = [System.IO.Path]::GetFullPath($RootLimitPath).TrimEnd('\', '/')
+
+    while ($currentDir.Length -gt $rootLimit.Length -and (Test-Path -LiteralPath $currentDir)) {
+        $items = Get-ChildItem -LiteralPath $currentDir -Force
+        if ($items.Count -eq 0) {
+            try {
+                Remove-Item -LiteralPath $currentDir -Force
+                $currentDir = Split-Path -Path $currentDir -Parent
+            } catch {
+                break
+            }
+        } else {
+            break
+        }
+    }
+}
 
 function Get-RelativePath {
     param(
@@ -453,6 +481,9 @@ foreach ($file in $files) {
             try {
                 Move-Item -LiteralPath $file.FullName -Destination $junkDestFile -Force
                 $junkFilesMoved++
+                
+                # Dynamic empty directory cleanup
+                Remove-EmptyDirectoryTree -DirectoryPath $file.DirectoryName -RootLimitPath $RootPath
             } catch {
                 Write-Host " -> FAILED TO MOVE" -ForegroundColor Red
                 Write-ErrorLog -RelativePath $relativePath -ErrorMessage "Failed to move junk file: $($_.Exception.Message)"
@@ -848,6 +879,9 @@ foreach ($file in $files) {
             try {
                 Remove-Item -LiteralPath $file.FullName -Force
                 Write-Host "  [CLEANUP]  File deleted successfully." -ForegroundColor DarkGray
+                
+                # Dynamic empty directory cleanup
+                Remove-EmptyDirectoryTree -DirectoryPath $file.DirectoryName -RootLimitPath $RootPath
             }
             catch {
                 Write-Host "  [CLEANUP]  FAILED TO DELETE" -ForegroundColor Red
